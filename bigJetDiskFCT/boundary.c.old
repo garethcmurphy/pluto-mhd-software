@@ -1,0 +1,711 @@
+#include"pluto.h"
+
+#define LOOP_kj(q)   for (k = k0; k <= k1; k++) {   \
+                     for (j = j0; j <= j1; j++) { q }}
+
+#define LOOP_ki(q)   for (k = k0; k <= k1; k++) {   \
+                     for (i = i0; i <= i1; i++) {  q }}
+
+#define LOOP_ji(q)   for (j = j0; j <= j1; j++) {   \
+                     for (i = i0; i <= i1; i++) {  q }}
+
+#define LOOP_kji(q)   for (k = k0; k <= k1; k++) {   \
+                      for (j = j0; j <= j1; j++) {   \
+                      for (i = i0; i <= i1; i++) {  q }}}
+
+#define LOOP_all(q)   for (nv = 0; nv < NVAR; nv++) { LOOP_kji(q)  }
+
+static void OUTFLOW_BOUND (const Data *, int,  
+                           int, int, int, int, int, int, Grid *);
+
+static void PERIODIC_BOUND (const Data *, int,  
+                           int, int, int, int, int, int, Grid *);
+
+static void REFLECTIVE_BOUND (const Data *, int, int,
+                           int, int, int, int, int, int, Grid *);
+
+/* ******************************************************************* */
+void BOUNDARY (const Data *d, int idim, Grid *grid)
+/*
+ *
+ * PURPOSE:
+ *
+ *  Set lower and upper boundary on cell centered and 
+ *  face centered data. 
+ *
+ *
+ * ARGUMENTS:
+ *
+ *  d (in/out)      solution arrays, containing centered and 
+ *                  staggered fields 
+ *
+ *  idim (in)       the dimension where the boundary is needed;
+ *               
+ *                  idim = IDIR   first dimension (x)
+ *                  idim = JDIR   second dimenson (y)
+ *                  idim = KDIR   third dimension (z)
+ *                  idim = -1  all dimensions
+ * 
+ *    
+ *  GXYZ (in)        grid arrays. 
+ *
+ *
+ *
+ * HISTORY:
+ *
+ *      Last modified by Andrea Mignone, 25 Oct 2003
+ *
+ ******************************************************************* */
+{
+  int  nv, i0, i1, j0, j1, k0, k1;
+  int  i, j, k, ngh;
+  int  this_side_type;   /* tells what kind of boundary are applied on this side */
+  int  side, iside;      /* lower or upper */
+  int  proc_has_side;    /* tells whether the current processor is on the boundary */
+  int  include_corners;  /* when = 1, corners must be included as well  */
+  int  first_dimension, last_dimension;
+  int  dimx[3] = {1, 0, 0};
+  int  dimy[3] = {0, 1, 0};
+  int  dimz[3] = {0, 0, 1};
+    
+/*  -----------------------------------------
+       Add internal boundary if required 
+    -----------------------------------------  */
+
+  #if ADD_INTERNAL_BOUNDARY == YES
+   INTERNAL_BOUNDARY (d->Vc, d->Vs, grid, IBEG, IEND, JBEG, JEND, KBEG, KEND);
+  #endif
+   
+/*  -----------------------------------------
+      Exchange data between processors 
+    -----------------------------------------  */
+   
+  #ifdef PARALLEL
+   MPI_Barrier (MPI_COMM_WORLD);
+
+   for (nv = 0; nv < NVAR; nv++) AL_Exchange (d->Vc[nv][0][0], SZ);
+
+   /* --------------------------------------------
+       Exchange staggered magnetic fields in the 
+       transverse directions
+      -------------------------------------------- */
+       
+   #ifdef STAGGERED_MHD 
+     for (nv = 0; nv < DIMENSIONS; nv++) AL_Exchange (d->Vs[nv][0][0], SZ);   
+/*   
+    AL_Exchange_dim (d->Vs[BXs][0][0], dimy, SZ);
+    AL_Exchange_dim (d->Vs[BYs][0][0], dimx, SZ);
+    #if DIMENSIONS == 3
+     AL_Exchange_dim (d->Vs[BXs][0][0], dimz, SZ);
+     AL_Exchange_dim (d->Vs[BYs][0][0], dimz, SZ);
+     AL_Exchange_dim (d->Vs[BZs][0][0], dimx, SZ);
+     AL_Exchange_dim (d->Vs[BZs][0][0], dimy, SZ);
+    #endif        
+*/    
+   #endif
+
+   MPI_Barrier (MPI_COMM_WORLD);
+  #endif
+  
+/*  ----  Set number of ghost zones  ----  */
+
+  ngh = grid[0].nghost;
+
+/*  ------------------------------------------------------------------------------
+      When idim == -1 boundaries are imposed on ALL sides, so a loop from 
+      first_dimension = 0 to last_dimension = DIMENSIONS is performed. 
+      In this case, boundary values are assigned in corners also.
+      When idim = n, boundaries are imposed at the beginning and the
+      end of the n-th direction.
+    ------------------------------------------------------------------------------ */ 
+
+  if (idim == -1) {
+    first_dimension = 0;
+    last_dimension  = DIMENSIONS - 1;
+    include_corners = ngh;  
+  } else {
+    first_dimension = last_dimension = idim;
+    include_corners = 0;
+  }
+
+/* --------------------------------------------------------
+                  Loop on directions       
+   -------------------------------------------------------- */
+
+  for (idim = first_dimension; idim <= last_dimension; idim++){
+
+  /*  ------------------------------------------- 
+        The next set of integers  
+         
+        (i0,i1), (j0,j1), (k0,k1)  
+     
+        define initial and final point for every
+        dimenension INSIDE the domain; i.e. 
+
+        i = i0...i1
+        j = j0...j1
+        k = k0...k1
+  
+       define points inside the domain, unless
+       corners are needed: in that case each
+       dimension is further expanded by 1 point on 
+       each side.
+     --------------------------------------------- */
+
+    i0 = IBEG;
+    j0 = JBEG;
+    k0 = KBEG;
+
+    i1 = IEND;
+    j1 = JEND;
+    k1 = KEND;
+
+    i0 -= include_corners;
+    i1 += include_corners;
+
+    #if DIMENSIONS > 1
+     j0 -= include_corners;
+     j1 += include_corners;
+    #endif
+    #if DIMENSIONS == 3
+     k0 -= include_corners;
+     k1 += include_corners;
+    #endif
+
+  /*  ----  Change one of (i0,i1) / (j0,j1) / (k0,k1) 
+            so that it spans the boundary             ---- */
+
+    if (idim == IDIR){
+      i0   = 0;
+      i1   = IBEG - 1;
+      side = X1_BEG;
+    } else if (idim == JDIR){
+      j0   = 0;
+      j1   = JBEG - 1;
+      side = X2_BEG;
+    #if DIMENSIONS == 3
+     } else if (idim == KDIR){
+       k0   = 0;
+       k1   = KBEG - 1;
+       side = X3_BEG;
+    #endif
+    }
+
+  /*  -----------------------------------------
+        check whether a given processor 
+        abuts the physical boundary 
+      ----------------------------------------- */
+ 
+    proc_has_side  = grid[idim].is_gbeg == 1;
+    this_side_type = grid[idim].lbound;  
+
+  /* ----------------------------------
+       For a given dimension (idim), 
+       loop on lower and upper sides    
+     ---------------------------------- */
+
+    for (iside = 0; iside < 2; iside++) {
+
+      if (proc_has_side) {
+
+        if (this_side_type == OUTFLOW) {
+
+          OUTFLOW_BOUND (d, side, i0, i1, j0, j1, k0, k1, grid);            
+
+        }else if (  (this_side_type == REFLECTIVE) 
+                 || (this_side_type == AXISYMMETRIC)
+                 || (this_side_type == EQTSYMMETRIC)){
+
+          REFLECTIVE_BOUND (d, side, this_side_type, 
+                            i0, i1, j0, j1, k0, k1, grid);
+
+        }else if (this_side_type == PERIODIC) {
+
+          #ifndef PARALLEL   
+           PERIODIC_BOUND (d, side, i0, i1, j0, j1, k0, k1, grid);
+          #endif
+
+        }else if (this_side_type == USERDEF) {
+
+          USERDEF_BOUNDARY (d->Vc, side, CELL_CENTER,
+                            i0, i1, j0, j1, k0, k1, grid);
+
+          #ifdef STAGGERED_MHD
+           USERDEF_BOUNDARY (d->Vs, side, FACE_CENTER,
+                             i0, i1, j0, j1, k0, k1, grid);
+          #endif
+
+         /* -----------------------------------------
+               define entropy in boundary zones
+            ----------------------------------------- */
+
+          #if ENTROPY_SWITCH == YES
+          {
+            real dns;
+
+            LOOP_kji(
+              dns = d->Vc[RHO][k][j][i];
+              d->Vc[ENTROPY][k][j][i] = d->Vc[PR][k][j][i]/pow(dns,gmm);
+            )
+          } 
+          #endif
+           
+        }else{
+          print ("Error: boundary %d is not defined. \n", DIR);
+          QUIT_PLUTO(1);
+        }
+      }
+
+  /*  ----  set indexes for upper side  ----  */
+
+      if (idim == IDIR){
+        i0   = IEND + 1;
+        i1   = IEND + ngh;
+        side = X1_END;
+      } else if (idim == JDIR){
+        j0   = JEND + 1;
+        j1   = JEND + ngh;
+        side = X2_END;
+      #if DIMENSIONS == 3      
+       } else if (idim == KDIR){
+         k0   = KEND + 1;
+         k1   = KEND + ngh;
+         side = X3_END;
+      #endif      
+      }
+      proc_has_side  = grid[idim].is_gend == 1;
+      this_side_type = grid[idim].rbound;  
+    }
+  }
+
+  #if ENTROPY_SWITCH == YES
+   Entropy_Correction (d, grid);
+  #endif
+}
+
+/* ************************************************************** */
+void OUTFLOW_BOUND (const Data *d, int side, 
+                    int i0, int i1, 
+                    int j0, int j1, 
+                    int k0, int k1, Grid *GXYZ)
+/*
+ *
+ *
+ *
+ *
+ *
+ *
+ **************************************************************** */
+{
+  int nv, i, j, k;
+
+  #ifdef STAGGERED_MHD
+   real ***bx, ***by, ***bz; 
+  
+   D_EXPAND(bx = d->Vs[BXs]; , 
+            by = d->Vs[BYs]; ,
+            bz = d->Vs[BZs];)
+  #endif
+
+
+  if (side == X1_BEG) { 
+
+    LOOP_all (d->Vc[nv][k][j][i] = d->Vc[nv][k][j][i1 + 1];)
+    #ifdef STAGGERED_MHD
+     LOOP_kji(D_EXPAND(   
+                                        ,
+       by[k][j][i] = by[k][j][i1 + 1];  ,
+       bz[k][j][i] = bz[k][j][i1 + 1];
+     ))
+   
+     i = IBEG - 2;
+     LOOP_kj(bx[k][j][i] = 2.0*bx[k][j][IBEG - 1] - bx[k][j][IBEG];)
+    #endif
+
+  }else if (side == X1_END){
+
+    LOOP_all (d->Vc[nv][k][j][i] = d->Vc[nv][k][j][i0 - 1];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(D_EXPAND( 
+                                        ,
+       by[k][j][i] = by[k][j][i0 - 1];  ,
+       bz[k][j][i] = bz[k][j][i0 - 1];
+     ))
+
+     i = IEND + 1;
+     LOOP_kj(bx[k][j][i] = 2.0*bx[k][j][IEND] - bx[k][j][IEND - 1];)
+    #endif
+
+  }else if (side == X2_BEG){
+
+    LOOP_all (d->Vc[nv][k][j][i] = d->Vc[nv][k][j1 + 1][i];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(D_EXPAND(
+       bx[k][j][i] = bx[k][j1 + 1][i];  ,
+                                        ,
+       bz[k][j][i] = bz[k][j1 + 1][i];
+     ))
+     j = JBEG - 2;
+     LOOP_ki(by[k][j][i] = 2.0*by[k][JBEG - 1][i] - by[k][JBEG][i];)
+    #endif
+
+  }else if (side == X2_END){
+
+    LOOP_all (d->Vc[nv][k][j][i] = d->Vc[nv][k][j0 - 1][i];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(D_EXPAND(
+       bx[k][j][i] = bx[k][j0 - 1][i];  ,
+                                        ,
+       bz[k][j][i] = bz[k][j0 - 1][i];
+     ))
+     j = JEND + 1;
+     LOOP_ki(by[k][j][i] = 2.0*by[k][JEND][i] - by[k][JEND - 1][i];)
+    #endif
+ 
+  }else if (side == X3_BEG){
+
+    LOOP_all (d->Vc[nv][k][j][i] = d->Vc[nv][k1 + 1][j][i];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(
+       bx[k][j][i] = bx[k1 + 1][j][i];  
+       by[k][j][i] = by[k1 + 1][j][i];  
+     )
+     k = KBEG - 2;
+     LOOP_ji(bz[k][j][i] = 2.0*bz[KBEG - 1][j][i] - bz[KBEG][j][i];)
+    #endif
+
+  }else if (side == X3_END){
+
+    LOOP_all (d->Vc[nv][k][j][i] = d->Vc[nv][k0 - 1][j][i];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(
+       bx[k][j][i] = bx[k0 - 1][j][i];  
+       by[k][j][i] = by[k0 - 1][j][i]; 
+     )
+     k = KEND + 1;
+     LOOP_ji(bz[k][j][i] = 2.0*bz[KEND][j][i] - bz[KEND - 1][j][i];)
+    #endif
+
+  }
+}
+
+/* *********************************************************** */
+void REFLECTIVE_BOUND (const Data *d, int side, int type, 
+                       int i0, int i1,
+                       int j0, int j1,
+                       int k0, int k1, Grid  *GXYZ)
+/*
+ *
+ * PURPOSE
+ *
+ *   set reflective, axisymmetric and equatorial symmetric
+ *   boundaries. 
+ *   Variables are symmetrized or anti-symmetrized 
+ *   depending on:
+ *
+ *   REFLECTIVE:    Vn -> -Vn,  Bn -> -Bn
+ *                  Vp ->  Vp,  Bp ->  Bp
+ *                  Vt ->  Vt,  Bt ->  Bt
+ *
+ *   AXISYMMETRIC:  Vn -> -Vn,  Bn -> -Bn
+ *                  Vp ->  Vp,  Bp ->  Bp
+ *                  Vt -> -Vt,  Bt -> -Bt
+ *
+ *   EQTSYMMETRIC:  Vn -> -Vn,  Bn ->  Bn
+ *                  Vp ->  Vp,  Bp -> -Bp
+ *                  Vt ->  Vt,  Bt -> -Bt
+ *
+ *    where (n) is the normal components, (p) and (t)
+ *    are the transverse (or poloidal and toroidal for
+ *    cylindrical and spherical coordinates) components.
+ * 
+ *
+ *
+ *
+ ************************************************************** */
+{
+  int   nv, i, j, k;
+  int   Vn, Vp, Vt;
+  int   Bn, Bp, Bt;
+  real  vsign[NVAR];
+
+  #ifdef STAGGERED_MHD
+   real ***bx, ***by, ***bz; 
+  
+   D_EXPAND(bx = d->Vs[BXs]; , 
+            by = d->Vs[BYs]; ,
+            bz = d->Vs[BZs];)
+  #endif
+
+  /* -------------------------------------
+       get normal (n), poloidal (p) and 
+       toroidal (t) vector components
+     ------------------------------------- */
+
+  if (side == X1_BEG || side == X1_END){
+    Vn = VX1; Vp = VX2; Vt = VX3;
+    #if PHYSICS == MHD || PHYSICS == RMHD
+     Bn = BX; Bp = BY; Bt = BZ;
+    #endif
+  }else if (side == X2_BEG || side == X2_END){
+    Vn = VX2; Vp = VX1; Vt = VX3;
+    #if PHYSICS == MHD || PHYSICS == RMHD
+     Bn = BY; Bp = BX; Bt = BZ;
+    #endif
+  }else if (side == X3_BEG || side == X3_END){
+    Vn = VX3; Vp = VX1; Vt = VX2;
+    #if PHYSICS == MHD || PHYSICS == RMHD
+     Bn = BZ; Bp = BX; Bt = BY;
+    #endif
+  }
+
+  /* ---------------------------------------
+       determine which variables flip sign
+     --------------------------------------- */
+
+  for (nv = 0; nv < NVAR; nv++) vsign[nv] = 1.0;
+
+  vsign[Vn] = -1.0;
+  #if PHYSICS == MHD || PHYSICS == RMHD
+   vsign[Bn] = -1.0;
+  #endif
+
+  #if COMPONENTS == 3
+   if (type == AXISYMMETRIC){
+     vsign[Vt] = -1.0;
+     #if PHYSICS == MHD || PHYSICS == RMHD
+      vsign[Bt] = -1.0;
+     #endif
+   }
+  #endif
+
+  #if PHYSICS == MHD || PHYSICS == RMHD
+   if (type == EQTSYMMETRIC){
+     EXPAND(vsign[Bn] =  1.0; ,
+            vsign[Bt] = -1.0; ,
+            vsign[Bp] = -1.0;)
+   }
+  #endif
+
+ /* -----------------------------------------
+          fill boundary zones 
+    ----------------------------------------- */
+
+  if (side == X1_BEG) {   
+
+    LOOP_all (d->Vc[nv][k][j][i] = vsign[nv]*d->Vc[nv][k][j][2*i1 - i + 1];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(D_EXPAND(                         
+                                                        ,
+       by[k][j][i] = vsign[BY]*by[k][j][2*i1 - i + 1];  ,
+       bz[k][j][i] = vsign[BZ]*bz[k][j][2*i1 - i + 1];
+     ))
+
+     LOOP_kj(bx[k][j][IBEG - 2] = vsign[BX]*bx[k][j][IBEG];)
+    #endif
+
+  }else if (side == X1_END){  
+
+    LOOP_all (d->Vc[nv][k][j][i] = vsign[nv]*d->Vc[nv][k][j][2*i0 - i - 1];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(D_EXPAND( 
+                                              ,
+       by[k][j][i] = vsign[BY]*by[k][j][2*i0 - i - 1];  ,
+       bz[k][j][i] = vsign[BZ]*bz[k][j][2*i0 - i - 1];
+     ))
+
+     LOOP_kj(bx[k][j][IEND + 1] = vsign[BX]*bx[k][j][IEND - 1];)
+    #endif
+
+  }else if (side == X2_BEG){  
+
+    LOOP_all (d->Vc[nv][k][j][i] = vsign[nv]*d->Vc[nv][k][2*j1 - j + 1][i];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(D_EXPAND(
+       bx[k][j][i] = vsign[BX]*bx[k][2*j1 - j + 1][i];  ,
+                                              ,
+       bz[k][j][i] = vsign[BZ]*bz[k][2*j1 - j + 1][i];
+     ))
+
+     LOOP_ki(by[k][JBEG - 2][i] = vsign[BY]*by[k][JBEG][i];)
+    #endif
+
+  }else if (side == X2_END){  
+
+    LOOP_all (d->Vc[nv][k][j][i] = vsign[nv]*d->Vc[nv][k][2*j0 - j - 1][i];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(D_EXPAND(
+       bx[k][j][i] = vsign[BX]*bx[k][2*j0 - j - 1][i];  ,
+                                              ,
+       bz[k][j][i] = vsign[BZ]*bz[k][2*j0 - j - 1][i];
+     ))
+
+     LOOP_ki(by[k][JEND + 1][i] = vsign[BY]*by[k][JEND - 1][i];)
+    #endif
+
+  }else if (side == X3_BEG){  
+
+    LOOP_all (d->Vc[nv][k][j][i] = vsign[nv]*d->Vc[nv][2*k1 - k + 1][j][i];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(
+       bx[k][j][i] = vsign[BX]*bx[2*k1 - k + 1][j][i]; 
+       by[k][j][i] = vsign[BY]*by[2*k1 - k + 1][j][i];  
+     )
+
+     LOOP_ji(bz[KBEG - 2][j][i] = vsign[BZ]*bz[KBEG][j][i];)
+    #endif
+
+  }else if (side == X3_END){  
+
+    LOOP_all (d->Vc[nv][k][j][i] = vsign[nv]*d->Vc[nv][2*k0 - k - 1][j][i];)
+
+    #ifdef STAGGERED_MHD     
+     LOOP_kji(
+       bx[k][j][i] = vsign[BX]*bx[2*k0 - k - 1][j][i];  
+       by[k][j][i] = vsign[BY]*by[2*k0 - k - 1][j][i];  
+     )
+                                                               
+     LOOP_ji(bz[KEND + 1][j][i] = vsign[BZ]*bz[KEND - 1][j][i];)
+    #endif
+  }
+
+}
+
+/* *********************************************************** */
+void PERIODIC_BOUND (const Data *d, int side, 
+                       int i0, int i1, 
+                       int j0, int j1, 
+                       int k0, int k1, Grid *GXYZ)
+/*
+ *
+ *
+ *
+ *
+ *
+ *
+ ************************************************************** */
+{
+  int nv, i, j, k;
+
+  #ifdef STAGGERED_MHD
+   real ***bx, ***by, ***bz; 
+  
+   D_EXPAND(bx = d->Vs[BXs]; , 
+            by = d->Vs[BYs]; ,
+            bz = d->Vs[BZs];)
+  #endif
+
+  if (side == X1_BEG) {
+
+    LOOP_all (d->Vc[nv][k][j][i] = d->Vc[nv][k][j][i + NX];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(D_EXPAND(  
+                                        ,
+       by[k][j][i] = by[k][j][i + NX];  ,
+       bz[k][j][i] = bz[k][j][i + NX];
+     ))
+
+     i = IBEG - 2;
+     LOOP_kj(bx[k][j][i] = bx[k][j][i + NX];)
+    #endif
+    
+  }else if (side == X1_END){
+
+    LOOP_all (d->Vc[nv][k][j][i] = d->Vc[nv][k][j][i - NX];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(D_EXPAND( 
+                                        ,
+       by[k][j][i] = by[k][j][i - NX];  ,
+       bz[k][j][i] = bz[k][j][i - NX];
+     ))
+
+     i = IEND + 1;
+     LOOP_kj(bx[k][j][i] = bx[k][j][i - NX];)
+    #endif
+
+  }else if (side == X2_BEG){
+
+    LOOP_all (d->Vc[nv][k][j][i] = d->Vc[nv][k][j + NY][i];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(D_EXPAND(
+       bx[k][j][i] = bx[k][j + NY][i];  ,
+                                        ,
+       bz[k][j][i] = bz[k][j + NY][i];
+     ))
+
+     j = JBEG - 2;
+     LOOP_ki(by[k][j][i] = by[k][j + NY][i];)
+
+    #endif
+
+  }else if (side == X2_END){
+
+    LOOP_all (d->Vc[nv][k][j][i] = d->Vc[nv][k][j - NY][i];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(D_EXPAND(
+       bx[k][j][i] = bx[k][j - NY][i];  ,
+                                        ,
+       bz[k][j][i] = bz[k][j - NY][i];
+     ))
+
+     j = JEND + 1;
+     LOOP_ki(by[k][j][i] = by[k][j - NY][i];)
+
+    #endif
+
+  }else if (side == X3_BEG){
+
+    LOOP_all (d->Vc[nv][k][j][i] = d->Vc[nv][k + NZ][j][i];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(D_EXPAND(
+       bx[k][j][i] = bx[k + NZ][j][i];  ,
+       by[k][j][i] = by[k + NZ][j][i];  ,
+                                                       
+     ))
+
+     k = KBEG - 2;
+     LOOP_ji(bz[k][j][i] = bz[k + NZ][j][i];)
+    #endif
+
+  }else if (side == X3_END){
+
+    LOOP_all (d->Vc[nv][k][j][i] = d->Vc[nv][k - NZ][j][i];)
+
+    #ifdef STAGGERED_MHD
+     LOOP_kji(D_EXPAND(
+       bx[k][j][i] = bx[k - NZ][j][i];  ,
+       by[k][j][i] = by[k - NZ][j][i];  ,
+                                                       
+     ))
+
+     k = KEND + 1;
+     LOOP_ji(bz[k][j][i] = bz[k - NZ][j][i];)
+    #endif
+  }
+}
+
+
+#undef LOOP_kji
+#undef LOOP_kj
+#undef LOOP_ki
+#undef LOOP_ji
+#undef LOOP_all
+
+
+
+
